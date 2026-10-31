@@ -16,7 +16,9 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from download import download, is_url  # noqa: E402
-from frames import MAX_FPS, auto_fps, auto_fps_focus, extract, format_time, get_metadata, parse_time  # noqa: E402
+from frames import (  # noqa: E402
+    MAX_FPS, auto_fps, auto_fps_focus, dedupe_frames, extract, format_time, get_metadata, parse_time,
+)
 from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
 from whisper import load_api_key, transcribe_video  # noqa: E402
 
@@ -44,6 +46,24 @@ def main() -> int:
         default=None,
         help="Force a specific Whisper backend. Default: prefer Groq, fall back to OpenAI.",
     )
+    ap.add_argument(
+        "--transcript-only",
+        action="store_true",
+        help="Captions + metadata only: no video download, no frames. Cheapest first pass.",
+    )
+    ap.add_argument("--lang", default=None, help="Caption language (default: the video's spoken language)")
+    ap.add_argument(
+        "--dedupe",
+        type=float,
+        default=0.02,
+        help="Drop frames this similar to the previous one (0-1 mean pixel diff; 0 disables). Default 0.02",
+    )
+    ap.add_argument(
+        "--para-chars",
+        type=int,
+        default=300,
+        help="Merge transcript into ~N-char timestamped paragraphs (0 = one line per cue). Default 300",
+    )
     args = ap.parse_args()
 
     max_frames = min(args.max_frames, 100)
@@ -55,14 +75,19 @@ def main() -> int:
     work.mkdir(parents=True, exist_ok=True)
     print(f"[watch] working dir: {work}", file=sys.stderr)
 
+    if args.transcript_only and not is_url(args.source):
+        raise SystemExit("--transcript-only needs a URL; local files have no captions to fetch")
     print(
         "[watch] downloading via yt-dlp…" if is_url(args.source) else "[watch] using local file…",
         file=sys.stderr,
     )
-    dl = download(args.source, work / "download")
+    dl = download(args.source, work / "download", lang=args.lang, video=not args.transcript_only)
     video_path = dl["video_path"]
 
-    meta = get_metadata(video_path)
+    if args.transcript_only:
+        meta = {"duration_seconds": float((dl.get("info") or {}).get("duration") or 0)}
+    else:
+        meta = get_metadata(video_path)
     full_duration = meta["duration_seconds"]
 
     start_sec = parse_time(args.start)
@@ -92,17 +117,22 @@ def main() -> int:
         f"{format_time(effective_start)}-{format_time(effective_end)} ({effective_duration:.1f}s)"
         if focused else f"full {effective_duration:.1f}s"
     )
-    print(f"[watch] extracting ~{target} frames at {fps:.3f} fps over {scope}…", file=sys.stderr)
-
-    frames = extract(
-        video_path,
-        work / "frames",
-        fps=fps,
-        resolution=args.resolution,
-        max_frames=max_frames,
-        start_seconds=start_sec,
-        end_seconds=end_sec,
-    )
+    frames: list[dict] = []
+    extracted = 0
+    if not args.transcript_only:
+        print(f"[watch] extracting ~{target} frames at {fps:.3f} fps over {scope}…", file=sys.stderr)
+        frames = extract(
+            video_path,
+            work / "frames",
+            fps=fps,
+            resolution=args.resolution,
+            max_frames=max_frames,
+            start_seconds=start_sec,
+            end_seconds=end_sec,
+        )
+        extracted = len(frames)
+        if args.dedupe > 0:
+            frames = dedupe_frames(frames, args.dedupe)
 
     transcript_segments: list[dict] = []
     transcript_text: str | None = None
@@ -111,12 +141,12 @@ def main() -> int:
         try:
             all_segments = parse_vtt(dl["subtitle_path"])
             transcript_segments = filter_range(all_segments, start_sec, end_sec) if focused else all_segments
-            transcript_text = format_transcript(transcript_segments)
+            transcript_text = format_transcript(transcript_segments, args.para_chars)
             transcript_source = "captions"
         except Exception as exc:
             print(f"[watch] subtitle parse failed: {exc}", file=sys.stderr)
 
-    if not transcript_segments and not args.no_whisper:
+    if not transcript_segments and not args.no_whisper and not args.transcript_only:
         backend, api_key = load_api_key(args.whisper)
         if backend and api_key:
             try:
@@ -127,7 +157,7 @@ def main() -> int:
                     api_key=api_key,
                 )
                 transcript_segments = filter_range(all_segments, start_sec, end_sec) if focused else all_segments
-                transcript_text = format_transcript(transcript_segments)
+                transcript_text = format_transcript(transcript_segments, args.para_chars)
                 transcript_source = f"whisper ({used_backend})"
             except SystemExit as exc:
                 print(f"[watch] whisper fallback failed: {exc}", file=sys.stderr)
@@ -161,9 +191,16 @@ def main() -> int:
         )
     if meta.get("width") and meta.get("height"):
         print(f"- **Resolution:** {meta['width']}x{meta['height']} ({meta.get('codec') or 'unknown codec'})")
-    mode = "focused" if focused else "full"
-    print(f"- **Frames:** {len(frames)} @ {fps:.3f} fps, {mode} mode (budget {target}, max {max_frames})")
-    print(f"- **Frame size:** {args.resolution}px wide")
+    if args.transcript_only:
+        print("- **Frames:** none (--transcript-only)")
+    else:
+        mode = "focused" if focused else "full"
+        dropped = f", {extracted - len(frames)} near-duplicates dropped" if extracted > len(frames) else ""
+        print(
+            f"- **Frames:** {len(frames)} @ {fps:.3f} fps, {mode} mode "
+            f"(budget {target}, max {max_frames}{dropped})"
+        )
+        print(f"- **Frame size:** {args.resolution}px wide")
     if transcript_segments:
         in_range = " in range" if focused else ""
         print(
@@ -173,7 +210,7 @@ def main() -> int:
     else:
         print("- **Transcript:** none available")
 
-    if not focused and full_duration > 600:
+    if not focused and full_duration > 600 and not args.transcript_only:
         mins = int(full_duration // 60)
         print()
         print(
@@ -182,18 +219,23 @@ def main() -> int:
             "re-run with `--start HH:MM:SS --end HH:MM:SS` to zoom into a specific section."
         )
 
-    print()
-    print("## Frames")
-    print()
-    print(f"Frames live at: `{work / 'frames'}`")
-    print()
-    print(
-        "**Read each frame path below with the Read tool to view the image.** "
-        "Frames are in chronological order; `t=MM:SS` is the absolute timestamp in the source video."
-    )
-    print()
-    for frame in frames:
-        print(f"- `{frame['path']}` (t={format_time(frame['timestamp_seconds'])})")
+    if frames:
+        print()
+        print("## Frames")
+        print()
+        print(f"Frames live at: `{work / 'frames'}`")
+        print()
+        print(
+            "**Read each frame path below with the Read tool to view the image.** "
+            "Frames are in chronological order; `t=MM:SS` is the absolute timestamp in the source video. "
+            "A range `t=A-B` means the screen stayed the same until B."
+        )
+        print()
+        for frame in frames:
+            stamp = format_time(frame["timestamp_seconds"])
+            if frame.get("until_seconds"):
+                stamp += f"-{format_time(frame['until_seconds'])}"
+            print(f"- `{frame['path']}` (t={stamp})")
 
     print()
     print("## Transcript")
@@ -210,6 +252,11 @@ def main() -> int:
         print("```")
     elif focused and dl.get("subtitle_path"):
         print(f"_No transcript lines fell inside {format_time(effective_start)} → {format_time(effective_end)}._")
+    elif args.transcript_only:
+        print(
+            "_No captions for this video. Next step: `gemini.py` (if GEMINI_API_KEY is set) or a "
+            "full run without --transcript-only (Whisper fallback)._"
+        )
     else:
         setup_py = SCRIPT_DIR / "setup.py"
         print(
@@ -227,4 +274,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     raise SystemExit(main())

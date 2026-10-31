@@ -185,6 +185,38 @@ def extract(
     ]
 
 
+def dedupe_frames(frames: list[dict], threshold: float = 0.02) -> list[dict]:
+    """Drop frames that look like the previous kept frame (static slides,
+    paused screens). Every frame costs the same image tokens, so a slide held
+    for two minutes should cost one frame, not eight.
+
+    Compares 64x36 grayscale thumbnails; `threshold` is the mean absolute pixel
+    difference (0-1) below which a frame counts as a repeat. Kept frames get
+    `until_seconds`, the last timestamp their content stayed on screen.
+    Needs Pillow; without it frames are returned unchanged.
+    """
+    try:
+        from PIL import Image, ImageChops, ImageStat
+    except ImportError:
+        print("[watch] Pillow not installed; skipping frame dedupe", file=sys.stderr)
+        return frames
+
+    kept: list[dict] = []
+    last_thumb = None
+    for frame in frames:
+        with Image.open(frame["path"]) as img:
+            thumb = img.convert("L").resize((64, 36))
+        if last_thumb is not None:
+            diff = ImageStat.Stat(ImageChops.difference(thumb, last_thumb)).mean[0] / 255
+            if diff < threshold:
+                kept[-1]["until_seconds"] = frame["timestamp_seconds"]
+                Path(frame["path"]).unlink(missing_ok=True)
+                continue
+        kept.append(dict(frame))
+        last_thumb = thumb
+    return kept
+
+
 if __name__ == "__main__":
     if len(sys.argv) < 3:
         print(

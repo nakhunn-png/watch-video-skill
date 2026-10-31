@@ -5,7 +5,12 @@ description: SLASH-COMMAND-ONLY. Invoke ONLY when the user explicitly types the 
 
 # Watch Video
 
-Claude can't stream video directly. This skill fakes it: a Python pipeline (vendored from [bradautomates/claude-video](https://github.com/bradautomates/claude-video) under `scripts/`) downloads the video, extracts auto-scaled JPEG frames with ffmpeg, pulls a timestamped transcript (native captions first, Whisper API fallback), and prints a markdown report listing every frame path. Claude then `Read`s each frame, aligns it to the spoken text, and writes a structured notes file.
+Claude can't stream video directly. This skill fakes it with scripts under `scripts/` (pipeline vendored from [bradautomates/claude-video](https://github.com/bradautomates/claude-video)):
+
+- `watch.py`: downloads the video, pulls a timestamped transcript (the video's own captions first, Whisper API fallback), extracts frames with ffmpeg, drops near-duplicate frames, and prints a markdown report listing every frame path.
+- `gemini.py`: has Gemini watch the whole video (frames + audio) and prints a short timestamped text index. Gemini pays for the video tokens; Claude reads only the text.
+
+The job is to answer the user's question with as few Claude tokens as the question allows. Pick the cheapest tier that can answer it, and go deeper only where it can't.
 
 ## When to invoke
 
@@ -16,127 +21,123 @@ Do NOT invoke on:
 - A bare YouTube URL pasted with a question ("what useful tips are in this video?" + URL)
 - Any natural-language ask about a video that lacks the explicit `/watch-video` command
 
-**Default for YouTube questions without the slash command:** pull the transcript the fastest way available — fetch the YouTube page / use yt-dlp captions / a transcript site — skim it, and answer from that. The frame-extraction pipeline is overkill unless the user explicitly asks for it via `/watch-video`.
-
-> If you'd rather have auto-trigger behavior, edit the `description:` line above to match the keywords you want Claude to fire on (e.g. "Use when the user wants Claude to watch, analyze, or take notes on a video"). Slash-only is the default in this repo because explicit invocation prevents accidental token burn on long videos.
+**Default for YouTube questions without the slash command:** pull the transcript the fastest way available (yt-dlp captions, or `watch.py --transcript-only`), skim it, and answer from that.
 
 ## Dependencies
 
-- **ffmpeg + ffprobe** on PATH — for frame and audio extraction
-- **yt-dlp** on PATH — for downloading and caption fetching
-- **Python 3.9+** — the bundled scripts use `from __future__ import annotations` so 3.9 works
-- **Optional:** Whisper API key for videos without native captions. Set `GROQ_API_KEY` (preferred — cheaper/faster, runs `whisper-large-v3`) or `OPENAI_API_KEY` in `~/.config/watch/.env`. Without one, captioned videos work fine; uncaptioned videos return frames-only.
+- **ffmpeg + ffprobe** and **yt-dlp** on PATH, **Python 3.9+**
+- **Pillow** (optional) for frame dedupe. Without it every frame is kept.
+- Keys, read from the environment first, then `~/.config/watch/.env`:
+  - `GEMINI_API_KEY` (optional): enables `gemini.py`. `GEMINI_MODEL` overrides the default model (`gemini-3.8-flash`).
+  - `GROQ_API_KEY` (preferred) or `OPENAI_API_KEY` (optional): Whisper fallback for videos without captions.
 
-Run `python scripts/setup.py --check` to verify dependencies, or `python scripts/setup.py` to scaffold the `.env` and check binaries. On macOS, the installer auto-installs missing binaries via Homebrew. On Linux/Windows, it prints exact install commands.
+`python scripts/setup.py --check` is silent when ready; `--json` shows which keys are present.
 
-## Pipeline
+## Cost model
 
-The work happens in `scripts/watch.py`. It downloads, extracts, transcribes, and prints a markdown report to stdout that lists every frame path. The pipeline auto-scales the frame budget by duration (hard cap 100 frames / 2 fps), so no manual interval tuning.
+| What Claude reads | Approx. Claude tokens |
+|---|---|
+| Transcript, 10-min talk | 3–5k |
+| One 512px frame | ~200 |
+| One 1024px frame | ~800 |
+| 40 frames at 512px | ~8k |
+| Gemini index, any length | 1–3k |
 
+- Tiling frames into contact sheets saves tool calls, not tokens. Image tokens scale with pixel area.
+- Gemini's own usage (~50k tokens for a 10-min video at low media resolution) is billed to the Gemini key, not to Claude.
+
+## Routing: pick the cheapest tier that answers the question
+
+Decide before running anything, from the user's question and the video's length.
+
+**Tier 0: transcript only.** Use it when the answer is in what is said: summaries of talks, lectures, interviews, podcasts, "what does X say about Y".
 ```
-python scripts/watch.py "<youtube-url-or-local-path>" [flags]
+python scripts/watch.py "<url>" --transcript-only
 ```
+No download, no frames. Captions come in the video's spoken language, not an auto-translation (`--lang ko` to force one). If no captions come back, go to Tier 1.
 
-Flags worth knowing:
-- `--start T` / `--end T` — focus on a section (`SS`, `MM:SS`, or `HH:MM:SS`). Auto-scales fps denser inside the range. Use this for any question about a specific moment, or for any video > 10 min where the user's question is about one part.
-- `--max-frames N` — lower the cap for tighter token budget (default 80, hard max 100).
-- `--resolution W` — frame width in px (default 512; bump to 1024 only if on-screen text is unreadable).
-- `--whisper groq|openai` — force a specific Whisper backend (default: prefer Groq if both keys exist).
-- `--no-whisper` — skip transcription entirely if no captions. Frames-only output.
-- `--out-dir DIR` — keep working files somewhere specific (default: an auto-generated tmp dir).
-
-Auto-fps budgets (full-video mode):
-- ≤30s → up to 30 frames
-- 30s–1min → ~40 frames
-- 1–3min → ~60 frames
-- 3–10min → ~80 frames
-- \>10min → 100 frames sparse (warning printed; consider `--start`/`--end`)
-
-## Step-by-step workflow
-
-### 1. Run the pipeline
-
-Default invocation, no flags:
-
+**Tier 1: Gemini index.** Use it when the visuals matter (slides, screen demos, spreadsheets, charts, on-screen numbers) and `GEMINI_API_KEY` is set. Also use it when there are no captions, or the video runs past 10 minutes.
 ```
-python scripts/watch.py "<source>"
+python scripts/gemini.py "<url-or-file>" [--ask "<the user's question>"] [--start T --end T]
 ```
+- It returns an overview, a scene index with `[MM:SS-MM:SS]` ranges and verbatim on-screen text, the numbers shown, and a "Verify with frames" list.
+- `--ask` puts the user's question to Gemini as well.
+- `--media-resolution` defaults to `low`. Use `high` only on a short range with small text.
+- Run it alongside Tier 0 when both speech and visuals matter. The transcript is the reliable record of what was said; the index tells you where things are on screen.
 
-For long videos where the user asked about a specific moment, pass `--start`/`--end`:
-
+**Tier 2: targeted frames.** Use it to confirm specific visual facts: exact figures, table contents, code, UI details. Every number you put in an answer from a video needs a frame behind it, because Gemini misreads small on-screen numbers.
 ```
-python scripts/watch.py "<source>" --start 2:15 --end 2:45
+python scripts/watch.py "<source>" --start 07:05 --end 07:40 --max-frames 8
 ```
+- Take the ranges from the Gemini index ("Verify with frames") or from transcript cues ("엑셀 파일을 열어 보면…", "as you can see on this slide").
+- Keep `--max-frames` small and add `--resolution 1024` only when 512px text is unreadable. Read only the frames you need.
 
-The script writes everything to a tmp working directory and prints a markdown report to stdout. Capture the stdout — it contains:
-- Header (Title, Uploader, Duration, Transcript source: `captions` / `whisper (groq)` / `whisper (openai)` / `none available`)
-- `## Frames` section with `- \`<absolute-path>\` (t=MM:SS)` lines
-- `## Transcript` section with `[MM:SS] text...` lines
-- Footer with `Work dir: <path>`
+**Tier 3: full frame scan.** This is the fallback when there is no Gemini key and the whole visual flow matters, or the user asks for complete visual notes.
+```
+python scripts/watch.py "<source>" --max-frames 40
+```
+- Near-duplicate frames are dropped automatically (`--dedupe 0.02`; `0` disables). A static slide shows up once as `t=02:42-03:55`.
+- On slide- or screen-heavy videos about half the frames go.
+- Past 10 minutes, prefer Tier 1 + Tier 2 over a sparse full scan.
 
-### 2. Read every frame
+**Several videos:** run them in parallel (background shell jobs), each with its own `--out-dir` in the scratchpad, at the same tier.
 
-Read all the listed frame paths in a single message (parallel `Read` tool calls). The Read tool renders JPEGs as images. Each frame's filename + `t=MM:SS` from the report tells you when it occurred — pair each frame with the matching transcript line at that timestamp.
+**Very long videos (>30 min):** confirm with the user before Tier 3. Tier 0 and Tier 1 are fine to run.
 
-For very long videos (>10 min, sparse mode): the budget already capped at 100 frames, so reading all of them is fine.
+## watch.py flags
 
-### 3. Write the summary
+- `--transcript-only`: captions + metadata, no download (URLs only)
+- `--start T` / `--end T`: focus range (`SS`, `MM:SS`, `HH:MM:SS`); the frame budget gets denser inside it
+- `--max-frames N`: frame cap (default 80, hard max 100)
+- `--resolution W`: frame width (default 512)
+- `--dedupe X`: near-duplicate threshold (default 0.02, 0 = off)
+- `--lang CODE`: caption language (default: the video's spoken language)
+- `--para-chars N`: transcript paragraph size (default 300; 0 = one line per cue)
+- `--whisper groq|openai`, `--no-whisper`: Whisper fallback control
+- `--out-dir DIR`: working directory (default: tmp)
 
-Output file: `<work-dir>/<slug>-notes.md` by default. If the user said "save notes somewhere permanent," ask where.
+The report has a header (title, uploader, duration, transcript source), `## Frames` (`- \`<path>\` (t=MM:SS[-MM:SS])`), `## Transcript` (`[MM:SS] paragraph…`), and a `Work dir:` footer.
 
-Structure the markdown like this:
+## Answering
+
+- **For a question:** answer it directly, citing `[MM:SS]`. Don't write a notes file nobody asked for.
+- **For notes or a summary:** write `<slug>-notes.md` (in the user's working folder when they want to keep it, otherwise the work dir):
 
 ```markdown
 # <Title>
-
-**Source:** <URL or local path>
-**Duration:** <mm:ss>
-**Uploader:** <if from YouTube>
-**Transcript source:** <captions / whisper (groq) / whisper (openai) / none>
+**Source:** <URL> · **Duration:** <mm:ss> · **Transcript:** <captions / whisper / gemini / none>
 
 ## One-line summary
-<≤20 words — the core claim or hook of the video>
-
-## TL;DR
-<3–5 bullet points capturing the main arguments, moments, or beats>
-
-## Timeline
-- **[00:00]** <what's happening visually + the key line being said>
-- **[00:15]** ...
-<one row per meaningful beat, not per frame>
-
-## Key quotes
-> "<verbatim quote>" — [mm:ss]
-
-## Visual notes
-<what the video shows that the transcript alone would miss — setting, B-roll, on-screen text, graphics, transitions, subject's emotion>
-
-## Takeaways (optional)
-<Only include if the content is directly relevant to the user's domain or goals. Omit otherwise.>
+## TL;DR            (3–5 bullets)
+## Timeline         (one row per meaningful beat: **[mm:ss]** what's on screen + what's said)
+## Key quotes       (> "verbatim" — [mm:ss])
+## Visual notes     (what the transcript alone would miss)
+## Takeaways        (only if relevant to the user's goals)
 ```
 
-### 4. Clean up
+- Say which tiers you used. When a figure comes from the Gemini index and has not been checked against a frame, flag it as unverified.
 
-After the `.md` is written, delete the work dir (it contains the full downloaded video + frames, which is large). The script prints `Work dir: <path>` in the footer of its report; pass that path to `rm -rf`.
+## Clean up
 
-If the user specified a non-tmp `--out-dir`, ask before deleting.
+Delete each `Work dir` after answering; it holds the downloaded video and frames. If the user chose a non-tmp `--out-dir`, ask first. `gemini.py` deletes any file it uploaded.
 
 ## Common gotchas
 
-- **YouTube Shorts / age-gated / members-only** — yt-dlp may fail. Surface its stderr verbatim; don't retry silently.
-- **No captions + no Whisper key** — the report says `Transcript: none available` and points at `setup.py`. Tell the user they can add a Groq key to `~/.config/watch/.env` for Whisper, or use `--no-whisper` for frames-only.
-- **Local file with no audio track** — Whisper extraction errors out cleanly. Use `--no-whisper` for frames-only.
-- **Very long videos (>30 min)** — confirm with the user before running. The pipeline caps at 100 frames so the budget is bounded, but a sparse 100-frame scan of a 60-min video isn't very useful. Almost always better to run focused on the specific section.
-- **Cloudflare 403 on Groq** — `whisper.py` already sets a custom User-Agent to clear Cloudflare's default-Python-UA block. If you ever see a 403, that's the failure mode.
-- **No automatic Groq → OpenAI fallback** — the script picks one Whisper backend at the start of each run (Groq if its key is set, else OpenAI) and stays on it. If Groq rate-limits, the script retries Groq twice then errors out. To use OpenAI instead, pass `--whisper openai`.
+- **Shorts / age-gated / members-only:** yt-dlp may fail. Show its stderr verbatim; don't retry silently. `gemini.py` only works with public YouTube URLs. For anything else, pass a local file.
+- **Gemini 404 "model no longer available":** the model was retired. Set `GEMINI_MODEL` to the one named in the error message.
+- **Gemini misreads small text:** low media resolution blurs spreadsheet cells. Verify figures with Tier 2 frames.
+- **No captions + no keys:** frames only. Tell the user they can add `GEMINI_API_KEY` or `GROQ_API_KEY`.
+- **Windows console encoding:** scripts force UTF-8 stdout. If you post-process output in your own Python, set `PYTHONIOENCODING=utf-8`.
+- **Groq Cloudflare 403:** `whisper.py` sets a custom User-Agent to avoid it. There is no automatic Groq → OpenAI fallback; pass `--whisper openai`.
 
 ## What NOT to do
 
-- Don't attempt to "watch" a video by inventing content based on title or thumbnail. If the pipeline fails, say so.
-- Don't write the summary before actually reading frames. The transcript alone misses visual context (B-roll, on-screen text, emotion, graphics, transitions).
-- Don't skip cleanup. Frame dumps + downloaded videos are large.
-- Don't auto-fire on a video URL. Slash-command-only — see "When to invoke" above.
+- Don't "watch" a video by inventing content from its title or thumbnail. If the pipeline fails, say so.
+- Don't describe visuals you haven't seen. To describe the screen you need either a Gemini index or frames.
+- Don't run Tier 3 by reflex when Tier 0 or Tier 1 already answers the question.
+- Don't skip cleanup.
+- Don't auto-fire on a video URL. Slash-command only.
 
 ## Engine attribution
 
-The pipeline scripts under `scripts/` are vendored from [bradautomates/claude-video](https://github.com/bradautomates/claude-video) (MIT). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the full upstream license.
+The download/frames/Whisper scripts are vendored from [bradautomates/claude-video](https://github.com/bradautomates/claude-video) (MIT). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

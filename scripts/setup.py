@@ -46,6 +46,12 @@ ENV_TEMPLATE = """# /watch API configuration
 
 GROQ_API_KEY=
 OPENAI_API_KEY=
+
+# Gemini: lets scripts/gemini.py watch a whole video (frames + audio) on
+# Gemini's bill and hand Claude a short timestamped text index instead of
+# dozens of frames. Get a key: https://aistudio.google.com/apikey
+GEMINI_API_KEY=
+# GEMINI_MODEL=gemini-3.8-flash
 """
 
 
@@ -216,6 +222,7 @@ def _status() -> dict:
         "missing_binaries": missing,
         "whisper_backend": backend,
         "has_api_key": has_key,
+        "gemini": bool(_read_env_key("GEMINI_API_KEY")),
         "config_file": str(CONFIG_FILE),
         "platform": platform.system(),
     }
@@ -231,7 +238,7 @@ def cmd_check() -> int:
       4 → both missing
     """
     s = _status()
-    if s["status"] == "ready":
+    if s["status"] == "ready" or (s["status"] == "needs_key" and s["gemini"]):
         return 0
 
     parts = []
